@@ -33,7 +33,7 @@ int main(int argc, char* argv[])
     {
         return 0;
     }
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
 
     sockaddr_in sin;
     sin.sin_family = AF_INET;

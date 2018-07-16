@@ -1,6 +1,11 @@
 #include <iostream>
 #include <fstream>
 #include <set>
+#include <sstream>
+#include <thread>
+#include <algorithm>
+
+#include <cassert>
 
 #include <Winsock2.h>
 #include <WS2tcpip.h>
@@ -13,6 +18,66 @@ const int port = 9999;
 const int perSize = 1028;
 
 const int MemMaxSize = perSize * 1024 * 200;
+
+
+struct RecvWork
+{
+    RecvWork(SOCKET s, int packnum, char *buf, int maxSize)
+        :sock(s), packNum(packnum), pBuf(buf), pBufMaxSize(maxSize), done(false)
+    {}
+
+    SOCKET sock;
+    int packNum;
+    char *pBuf;
+    int pBufMaxSize;
+    bool done;
+};
+
+void RecvThread(RecvWork *work)
+{
+    if (work == nullptr)
+        return;
+    if (work->pBuf == nullptr)
+        return;
+    if (work->done)
+        return;
+
+    set<int> TotalSequence, curSeq;
+    for (int i = 0; i < work->packNum; ++i)
+    {
+        TotalSequence.insert(i);
+    }
+    assert(TotalSequence.size() == work->packNum);
+
+    char *pHead = work->pBuf;
+    int seq = -1;
+    int ret;
+
+    do
+    {
+        ret = ::recv(work->sock, (char*)&seq, 4, 0);
+        if (ret != 4)
+        {
+            cout << "Recv less than 4" << " ret " << ret << WSAGetLastError() << endl;
+            return;
+        }
+        cout << " recv pack num " << seq << endl;
+
+        curSeq.insert(seq);
+
+        ret = ::recv(work->sock, work->pBuf + seq * 1024, 1024, 0);
+        if (ret != 1024)
+        {
+            cout << "Recv less than 4" << " ret " << ret << WSAGetLastError() << endl;
+            return;
+        }
+
+    } while (curSeq.size() == work->packNum);
+
+    work->done = true;
+    return;
+}
+
 
 template<typename T>
 inline T round_up(T t)
@@ -28,7 +93,7 @@ int main(int argc, char* argv[])
     {
         return 0;
     }
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
 
     sockaddr_in sin, cli;
     memset(&sin, 0, sizeof sin);
@@ -36,7 +101,7 @@ int main(int argc, char* argv[])
     sin.sin_family = AF_INET;
     sin.sin_port = htons(port);
     sin.sin_addr.S_un.S_addr = INADDR_ANY;
-    
+
     BOOL optval = 1;
     int ret = ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof optval);
     if (ret == SOCKET_ERROR)
@@ -52,20 +117,20 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    ret = ::listen(sock, 20);
-    if (ret == SOCKET_ERROR)
-    {
-        cout << "listen failed with errno : " << WSAGetLastError() << endl;
-        return -1;
-    }
+    //ret = ::listen(sock, 20);
+    //if (ret == SOCKET_ERROR)
+    //{
+    //    cout << "listen failed with errno : " << WSAGetLastError() << endl;
+    //    return -1;
+    //}
 
-    int cliLen = sizeof cli;
-    SOCKET cSock = ::accept(sock, (sockaddr *)&cli, &cliLen);
-    if (cSock == SOCKET_ERROR)
-    {
-        cout << "accept failed with errno : " << WSAGetLastError() << endl;
-        return -1;
-    }
+    //int cliLen = sizeof cli;
+    //SOCKET cSock = ::accept(sock, (sockaddr *)&cli, &cliLen);
+    //if (cSock == SOCKET_ERROR)
+    //{
+    //    cout << "accept failed with errno : " << WSAGetLastError() << endl;
+    //    return -1;
+    //}
 
     int recvBufSize = 128 * 1024 * 1024;
     ret = ::setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&recvBufSize, sizeof recvBufSize);
@@ -77,14 +142,14 @@ int main(int argc, char* argv[])
 
     long long fileSize = -1;
 
-    ret = recv(cSock, (char *)&fileSize, sizeof fileSize, 0);
+    ret = recv(sock, (char *)&fileSize, sizeof fileSize, 0);
     if (ret != sizeof fileSize || fileSize == 0)
     {
         cout << "can't recv fileSize" << endl;
         return -1;
     }
     cout << "recv file size " << fileSize << " bytes" << endl;
-    
+
     int packNum = round_up(fileSize) / 1024;
     cout << "Pack number : " << packNum << endl;
     int memSize = packNum * perSize < MemMaxSize ? packNum * perSize : MemMaxSize;
@@ -95,31 +160,25 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    ofstream out("out.mp4", ios::trunc | ios::binary | ios::out);
+    ostringstream cmd;
+    string fileName("out.mp4");
+    cmd << "fsutil file createnew " << fileName << " " << fileSize;
+    system(cmd.str().c_str());
+
+    ofstream out(fileName, ios::binary | ios::out);
+    if (!out)
+    {
+        cout << "can't open " << fileName << endl;
+        return -1;
+    }
+
+    RecvWork work(sock, packNum, pBuf, memSize);
+    std::thread recvThread(RecvThread, &work);
+    recvThread.join();
+
+    if (!work.done)
+        return -1;
     out.write(pBuf, fileSize);
-    out.seekp(0);
-
-    char *pHead = pBuf;
-    int seq = -1;
-    for (int i = 0; i < packNum; ++i)
-    {
-        ret = ::recv(cSock, pBuf, perSize, MSG_WAITALL);
-        if (ret != perSize)
-        {
-            cout << "Recv less than 1028" << " ret " << ret <<WSAGetLastError() << endl;
-            return -1;
-        }
-        memcpy(&seq, pBuf, 4);
-        cout << "Loop " << i << " recv pack num " << seq << endl;
-        pBuf += perSize;
-    }
-    pBuf = pHead;
-
-    for (int i = 0; i < packNum; ++i)
-    {
-        out.write(pBuf + 4, 1024);
-        pBuf += perSize;
-    }
 
     out.close();
     closesocket(sock);
