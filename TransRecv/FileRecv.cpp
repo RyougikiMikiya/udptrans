@@ -4,6 +4,10 @@
 #include <sstream>
 #include <thread>
 #include <algorithm>
+#include <vector>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 
 #include <cassert>
 
@@ -13,12 +17,21 @@
 
 using namespace std;
 
-const int port = 9999;
+const int UDP_Port = 9999;
+
+const int TCP_Port = 10000;
 
 const int perSize = 1028;
 
 const int MemMaxSize = perSize * 1024 * 200;
 
+mutex flagMutex;
+condition_variable flagCV;
+bool retranReady = false;
+
+mutex retranMutex;
+condition_variable retranCV;
+vector<int> retransNum;
 
 struct RecvWork
 {
@@ -33,6 +46,23 @@ struct RecvWork
     bool done;
 };
 
+enum MsgType
+{
+    MT_RetranRequset = 0xEE,
+    MT_RetranResult
+};
+
+const int MsgHeader = 0xCAFE0096;
+
+#pragma pack(push, 1)
+struct RetransRecvResult
+{
+    int msgheader;
+    MsgType type;
+    bool result;
+};
+#pragma pack(pop)
+
 void RecvThread(RecvWork *work)
 {
     if (work == nullptr)
@@ -42,39 +72,126 @@ void RecvThread(RecvWork *work)
     if (work->done)
         return;
 
-    set<int> TotalSequence, curSeq;
+    vector<int> TotalPackNum(work->packNum), curPack;
+    set<int> recvedPack;
+
     for (int i = 0; i < work->packNum; ++i)
     {
-        TotalSequence.insert(i);
+        TotalPackNum[i] = i;
     }
-    assert(TotalSequence.size() == work->packNum);
+    assert(TotalPackNum.size() == work->packNum);
+    retransNum.resize(work->packNum);
 
     char *pHead = work->pBuf;
     int seq = -1;
     int ret;
+    
+    DWORD recvTimeout = 200;
+    ret = ::setsockopt(work->sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recvTimeout, sizeof(recvTimeout));
+    if (ret == SOCKET_ERROR)
+    {
+        cout << "setsockopt failed with errno : " << WSAGetLastError() << endl;
+        return;
+    }
 
     do
     {
         ret = ::recv(work->sock, (char*)&seq, 4, 0);
         if (ret != 4)
         {
-            cout << "Recv less than 4" << " ret " << ret << WSAGetLastError() << endl;
-            return;
+            if (ret == WSAETIMEDOUT)
+            {
+                {
+                    sort(curPack.begin(), curPack.end());
+                    lock_guard<mutex> lk(retranMutex);
+                    retransNum.clear();
+                    set_difference(TotalPackNum.begin(), TotalPackNum.end(), curPack.begin(), curPack.end(), retransNum.begin());
+                    TotalPackNum = retransNum;
+                    curPack.clear();
+                }
+                retranCV.notify_one();
+                assert(retranReady == false);
+                unique_lock<mutex> lk(flagMutex);
+                //chrono::seconds s;
+                if (flagCV.wait_for(lk, 2s, [] { return retranReady == true; }))
+                {
+                    retranReady = false;
+                    continue;
+                }
+                else
+                {
+                    cout << "Send Retrans request failed! This time work failed!" << endl;
+                    return;
+                }
+            }
+            else
+            {
+                cout << "Recv less than 4" << " ret " << ret << WSAGetLastError() << endl;
+                return;
+            }
         }
         cout << " recv pack num " << seq << endl;
-
-        curSeq.insert(seq);
 
         ret = ::recv(work->sock, work->pBuf + seq * 1024, 1024, 0);
         if (ret != 1024)
         {
-            cout << "Recv less than 4" << " ret " << ret << WSAGetLastError() << endl;
-            return;
+            if (ret == WSAETIMEDOUT)
+            {
+                cout << "Recv body time out" << endl;
+                continue;
+            }
+            else
+            {
+                cout << "Recv less than 1024" << " ret " << ret << WSAGetLastError() << endl;
+                return;
+            }
         }
+        curPack.push_back(seq);
+        recvedPack.insert(seq);
 
-    } while (curSeq.size() == work->packNum);
+    } while (recvedPack.size() == work->packNum);
 
     work->done = true;
+    return;
+}
+
+void retransThread(SOCKET sock)
+{
+REDO:
+    unique_lock<mutex> lk(retranMutex);
+    retranCV.wait(lk, [] {return !retransNum.empty(); });
+    int total = retransNum.size() * sizeof(int);
+    int ret = ::send(sock, (const char*)retransNum.data(), total, 0);
+    lk.unlock();
+    if (ret != total)
+    {
+        cout << "Send reTran failed" << "ret " << ret << " Err:" << WSAGetLastError() << endl;
+        return;
+    }
+
+    RetransRecvResult result;
+    ret = ::recv(sock, (char*)&result, sizeof(result), MSG_WAITALL);
+    if (ret != sizeof(result))
+    {
+        cout << "Recv reTran failed" << "ret " << ret << " Err:" << WSAGetLastError() << endl;
+        return;
+    }
+
+    if ( result.msgheader != MsgHeader || result.type != MT_RetranResult )
+    {
+        cout << "Recv wrong msg" << endl;
+        return;
+    }
+    
+    if (result.result == true)
+    {
+        lock_guard<mutex> lg(flagMutex);
+        flagCV.notify_one();
+    }
+    else
+    {
+        goto REDO;
+    }
     return;
 }
 
@@ -93,56 +210,69 @@ int main(int argc, char* argv[])
     {
         return 0;
     }
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    SOCKET UDPSock = socket(AF_INET, SOCK_DGRAM, 0);
+    SOCKET TCPSock = socket(AF_INET, SOCK_STREAM, 0);
 
-    sockaddr_in sin, cli;
+    sockaddr_in sin, tcp_in, cli;
     memset(&sin, 0, sizeof sin);
     memset(&cli, 0, sizeof sin);
+    memset(&tcp_in, 0, sizeof tcp_in);
     sin.sin_family = AF_INET;
-    sin.sin_port = htons(port);
+    sin.sin_port = htons(UDP_Port);
     sin.sin_addr.S_un.S_addr = INADDR_ANY;
 
+    tcp_in.sin_family = AF_INET;
+    tcp_in.sin_port = htons(TCP_Port);
+    tcp_in.sin_addr.S_un.S_addr = INADDR_ANY;
+
     BOOL optval = 1;
-    int ret = ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof optval);
+    int ret = ::setsockopt(TCPSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof optval);
     if (ret == SOCKET_ERROR)
     {
-        cout << "setsockopt failed with errno : " << WSAGetLastError() << endl;
+        cout << "setsockopt SO_REUSEADDR failed with errno : " << WSAGetLastError() << endl;
         return -1;
     }
 
-    ret = ::bind(sock, (const sockaddr *)&sin, sizeof sin);
+    ret = ::bind(UDPSock, (const sockaddr *)&sin, sizeof sin);
+    if (ret == SOCKET_ERROR)
+    {
+        cout << "Bind UDPSock failed with errno : " << WSAGetLastError() << endl;
+        return -1;
+    }
+
+    ret = ::bind(TCPSock, (const sockaddr *)&tcp_in, sizeof tcp_in);
     if (ret == SOCKET_ERROR)
     {
         cout << "Bind failed with errno : " << WSAGetLastError() << endl;
         return -1;
     }
 
-    //ret = ::listen(sock, 20);
-    //if (ret == SOCKET_ERROR)
-    //{
-    //    cout << "listen failed with errno : " << WSAGetLastError() << endl;
-    //    return -1;
-    //}
-
-    //int cliLen = sizeof cli;
-    //SOCKET cSock = ::accept(sock, (sockaddr *)&cli, &cliLen);
-    //if (cSock == SOCKET_ERROR)
-    //{
-    //    cout << "accept failed with errno : " << WSAGetLastError() << endl;
-    //    return -1;
-    //}
-
-    int recvBufSize = 128 * 1024 * 1024;
-    ret = ::setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&recvBufSize, sizeof recvBufSize);
+    ret = ::listen(TCPSock, 20);
     if (ret == SOCKET_ERROR)
     {
-        cout << "setsockopt failed with errno : " << WSAGetLastError() << endl;
+        cout << "listen failed with errno : " << WSAGetLastError() << endl;
+        return -1;
+    }
+
+    int cliLen = sizeof cli;
+    SOCKET cSock = ::accept(TCPSock, (sockaddr *)&cli, &cliLen);
+    if (cSock == SOCKET_ERROR)
+    {
+        cout << "accept failed with errno : " << WSAGetLastError() << endl;
+        return -1;
+    }
+
+    int recvBufSize = 128 * 1024 * 1024;
+    ret = ::setsockopt(UDPSock, SOL_SOCKET, SO_SNDBUF, (const char*)&recvBufSize, sizeof recvBufSize);
+    if (ret == SOCKET_ERROR)
+    {
+        cout << "setsockopt UDPSock failed with errno : " << WSAGetLastError() << endl;
         return -1;
     }
 
     long long fileSize = -1;
 
-    ret = recv(sock, (char *)&fileSize, sizeof fileSize, 0);
+    ret = recv(UDPSock, (char *)&fileSize, sizeof fileSize, 0);
     if (ret != sizeof fileSize || fileSize == 0)
     {
         cout << "can't recv fileSize" << endl;
@@ -172,8 +302,9 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    RecvWork work(sock, packNum, pBuf, memSize);
+    RecvWork work(UDPSock, packNum, pBuf, memSize);
     std::thread recvThread(RecvThread, &work);
+    std::thread retransThread(retransThread, TCPSock);
     recvThread.join();
 
     if (!work.done)
@@ -181,7 +312,7 @@ int main(int argc, char* argv[])
     out.write(pBuf, fileSize);
 
     out.close();
-    closesocket(sock);
+    closesocket(UDPSock);
     WSACleanup();
     return 0;
 }

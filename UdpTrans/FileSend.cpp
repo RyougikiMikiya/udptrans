@@ -7,7 +7,9 @@
 
 using namespace std;
 
-const int port = 9999;
+const int UDP_Port = 9999;
+
+const int TCP_Port = 10000;
 
 const int perSize = 1028;
 
@@ -33,27 +35,40 @@ int main(int argc, char* argv[])
     {
         return 0;
     }
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    SOCKET udpSock = socket(AF_INET, SOCK_DGRAM, 0);
+    SOCKET tcpSock = socket(AF_INET, SOCK_STREAM, 0);
 
-    sockaddr_in sin;
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(port);
-    /*sin.sin_addr.S_un.S_addr = inet_addr("127.0.0.1");*/
-    inet_pton(AF_INET, "127.0.0.1", (void*)&sin.sin_addr.S_un.S_addr);
+    sockaddr_in udp_in, tcp_in;
+    memset(&udp_in, 0, sizeof udp_in);
+    memset(&tcp_in, 0, sizeof tcp_in);
+    udp_in.sin_family = AF_INET;
+    udp_in.sin_port = htons(UDP_Port);
+    inet_pton(AF_INET, "127.0.0.1", (void*)&udp_in.sin_addr.S_un.S_addr);
+
+    tcp_in.sin_family = AF_INET;
+    tcp_in.sin_port = htons(TCP_Port);
+    inet_pton(AF_INET, "127.0.0.1", (void*)&tcp_in.sin_addr.S_un.S_addr);
 
     int sendBufSize = 32 * 1024 * 1024;
-    int ret = ::setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&sendBufSize, sizeof sendBufSize);
+    int ret = ::setsockopt(udpSock, SOL_SOCKET, SO_SNDBUF, (const char*)&sendBufSize, sizeof sendBufSize);
     if (ret == SOCKET_ERROR)
     {
         cout << "setsockopt failed with errno : " << WSAGetLastError() << endl;
         return -1;
     }
 
-    int len = sizeof(sin);
-    ret = ::connect(sock, (const sockaddr *)&sin, len);
+    int len = sizeof(udp_in);
+    ret = ::connect(udpSock, (const sockaddr *)&udp_in, len);
     if (ret == SOCKET_ERROR)
     {
-        cout << "Connect failed with errno : " << WSAGetLastError() << endl;
+        cout << "UDP Connect failed with errno : " << WSAGetLastError() << endl;
+        return -1;
+    }
+
+    ret = ::connect(tcpSock, (const sockaddr *)&tcp_in, len);
+    if (ret == SOCKET_ERROR)
+    {
+        cout << "TCP Connect failed with errno : " << WSAGetLastError() << endl;
         return -1;
     }
 
@@ -90,7 +105,7 @@ int main(int argc, char* argv[])
     pBuf = pHead;
     file.close();
 
-    ret = ::send(sock, (const char *)&fileSize, sizeof fileSize, 0);
+    ret = ::send(udpSock, (const char *)&fileSize, sizeof fileSize, 0);
     if (ret != sizeof fileSize)
     {
         cout << "Cant send fileSize! Err: " <<  WSAGetLastError() << endl;
@@ -99,7 +114,7 @@ int main(int argc, char* argv[])
 
     for (int i = 0; i < packNum; ++i)
     {
-        ret = ::send(sock, pBuf, perSize, 0);
+        ret = ::send(udpSock, pBuf, perSize, 0);
         if (ret != perSize)
         {
             cout << "Send " << ret << " bytes data!" << WSAGetLastError() <<endl;
@@ -108,7 +123,7 @@ int main(int argc, char* argv[])
         pBuf += perSize;
     }
 
-    closesocket(sock);
+    closesocket(udpSock);
     WSACleanup();
     return 0;
 }
